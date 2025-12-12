@@ -18,6 +18,6 @@ test_dataset:
   split: test
 
 
-batch_size: 512 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
-num_workers: 16
+batch_size: 32 
+num_workers: 8
 pin_memory: False

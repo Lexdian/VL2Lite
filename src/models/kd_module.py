@@ -48,6 +48,7 @@ class KDModule(LightningModule):
         use_teacher: bool,
         kd_criterion,
         compile: bool,
+        kd_alpha_exponent: float,  # <-- PARÂMETRO ADICIONADO AQUI
     ) -> None:
         """Initialize a `MNISTLitModule`.
 
@@ -102,6 +103,52 @@ class KDModule(LightningModule):
         self.val_acc.reset()
         self.val_acc_best.reset()
 
+    def calculate_dynamic_loss_weights(self, student_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calcula os pesos de perda dinâmicos baseados na incerteza do Aluno.
+
+        Lógica:
+        1. A incerteza (e, portanto, o peso de KD) é alta quando a confiança do aluno é baixa.
+        2. A incerteza é elevada ao expoente beta (kd_alpha_exponent).
+        3. O peso de Classificação (CE) é o inverso.
+        """
+        # 1. Obter a probabilidade máxima (confiança)
+        probabilities = torch.softmax(student_logits, dim=1)
+        # O torch.max(..., dim=1).values retorna a confiança do modelo na sua melhor previsão para cada amostra
+        max_confidence = torch.max(probabilities, dim=1).values
+
+        # 2. Calcular a Incerteza (1 - Confiança)
+        # Atenção: Manter o itemizado para o cálculo correto dos gradientes no batch
+        uncertainty = 1.0 - max_confidence
+
+        # 3. Aplicar o Expoente Beta (kd_alpha_exponent)
+        # kd_loss_weight é o peso dado à perda de Destilação (L_KD + L_Img)
+        beta = self.hparams.kd_alpha_exponent
+        kd_loss_weight = torch.pow(uncertainty, beta)
+
+        # Ponderação Crucial (Correção do Bug anterior):
+        # Para que o peso de classificação não zere acidentalmente o CE,
+        # e para garantir que o CE e o KD sempre contribuam, vamos usar
+        # o peso de KD calculado acima e o peso de Classificação (CE)
+        # será o que resta até o peso total.
+
+        # Calculamos a média do peso de KD para o batch atual
+        mean_kd_weight = torch.mean(kd_loss_weight)
+
+        # Peso da Classificação é o inverso (garantindo que o CE nunca seja totalmente 0)
+        # No artigo DA-KD, o peso de KD é dinâmico e o peso de CE é frequentemente 1.0,
+        # mas vamos manter o balanceamento para evitar o estouro do gradiente.
+
+        # Vamos manter o peso de CE como 1.0 e apenas modular o peso de KD (simplificando a partir do DA-KD)
+        # Mas para fins de comparação direta com o código de base (onde W_CE + W_KD = 1), faremos:
+        cls_loss_weight = 1.0 - mean_kd_weight
+
+        # Garantir que os pesos estejam entre 0 e 1, embora a lógica já garanta isso
+        cls_loss_weight = torch.clamp(cls_loss_weight, 0.0, 1.0)
+        mean_kd_weight = torch.clamp(mean_kd_weight, 0.0, 1.0)
+
+        return cls_loss_weight, mean_kd_weight
+
     def model_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -115,13 +162,6 @@ class KDModule(LightningModule):
             - A tensor of target labels.
         """
 
-        def calculate_loss_weights(current_epoch, total_epochs):
-            weight1 = current_epoch / (total_epochs * 8)
-            weight1 = np.clip(weight1, 0, 1)
-            weight2 = 1 - weight1
-            weight2 = np.clip(weight2, 0, 1)
-            return weight1, weight2
-
         x, y = batch
         loss_dict = {}
         if self.use_teacher:
@@ -129,7 +169,7 @@ class KDModule(LightningModule):
             img_loss, kd_loss = self.kd_criterion(outputs)
             cls_loss = self.criterion(outputs[1], y)
             
-            cls_loss_weight, kd_loss_weight = calculate_loss_weights(self.current_epoch, self.trainer.max_epochs)
+            cls_loss_weight, kd_loss_weight = self.calculate_dynamic_loss_weights(outputs[1].detach())
             cls_loss = cls_loss_weight*cls_loss
             img_loss = kd_loss_weight*img_loss
             kd_loss = kd_loss_weight*kd_loss
